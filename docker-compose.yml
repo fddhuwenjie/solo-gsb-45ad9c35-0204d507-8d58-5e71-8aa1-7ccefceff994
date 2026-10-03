@@ -1,0 +1,13 @@
+services:
+  api:
+    build: .
+    image: subnet-allocator:latest
+    container_name: subnet-allocator
+    ports:
+      - "8000:8000"
+    volumes:
+      - subnet-data:/data
+    restart: unless-stopped
+
+volumes:
+  subnet-data:

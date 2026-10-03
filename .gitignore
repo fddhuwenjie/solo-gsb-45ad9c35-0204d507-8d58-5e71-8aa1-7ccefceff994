@@ -1,0 +1,13 @@
+# Python
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# SQLite
+*.db
+*.db-wal
+*.db-shm
+
+# OS / editor
+.DS_Store
