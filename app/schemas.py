@@ -183,6 +183,73 @@ class CidrPolicyCompileResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Policy-driven batch reservations
+# ---------------------------------------------------------------------------
+
+
+class ReservationItemRequest(BaseModel):
+    request_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for this reservation",
+    )
+    prefix_length: int = Field(..., ge=0, le=32)
+
+
+class BatchReserveRequest(BaseModel):
+    batch_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the whole batch",
+    )
+    default_action: Literal["allow", "deny"] = Field(
+        ...,
+        description="Action for pool addresses matched by no rule",
+    )
+    rules: list[CidrPolicyRuleRequest] = Field(
+        default_factory=list,
+        description=(
+            "Priority-ordered allow/deny rules compiled over the pool CIDR; "
+            "every reserved subnet must fall completely inside an allow segment"
+        ),
+    )
+    items: list[ReservationItemRequest] = Field(
+        ...,
+        min_length=1,
+        description="Reservations to place, in placement order",
+    )
+
+
+class ReservationItemResult(BaseModel):
+    id: int = Field(..., description="Allocation row id")
+    request_id: str
+    cidr: str
+    prefix_length: int
+    created_at: str
+    replayed: bool = Field(
+        ...,
+        description=(
+            "True when this item resolved to a pre-existing allocation via "
+            "request_id idempotency instead of reserving new space"
+        ),
+    )
+
+
+class BatchReserveResponse(BaseModel):
+    batch_id: str
+    pool_id: int
+    reservations: list[ReservationItemResult] = Field(
+        ...,
+        description="request_id -> reserved CIDR mapping, in input order",
+    )
+    created_at: str
+    replayed: bool = Field(
+        ...,
+        description="True when a stored batch was returned instead of reserving",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pool snapshot export / restore
 # ---------------------------------------------------------------------------
 

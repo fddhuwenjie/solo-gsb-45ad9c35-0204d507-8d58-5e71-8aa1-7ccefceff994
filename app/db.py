@@ -100,6 +100,19 @@ def init_db() -> None:
                 activated_at     TEXT
             );
 
+            -- One row per completed batch reservation.  The UNIQUE batch_id
+            -- makes a retried batch replay the original result instead of
+            -- reserving twice; params/result store the canonical request
+            -- fingerprint and the reserved mapping in input order.
+            CREATE TABLE IF NOT EXISTS reservation_batches (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                batch_id    TEXT    NOT NULL UNIQUE,
+                pool_id     INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                params      TEXT    NOT NULL,
+                result      TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL
+            );
+
             -- Fast lookup of all plans belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool
                 ON allocations(pool_id);
@@ -107,6 +120,8 @@ def init_db() -> None:
                 ON exclusions(pool_id);
             CREATE INDEX IF NOT EXISTS idx_bgp_plans_pool
                 ON bgp_plans(pool_id);
+            CREATE INDEX IF NOT EXISTS idx_reservation_batches_pool
+                ON reservation_batches(pool_id);
             """
         )
 

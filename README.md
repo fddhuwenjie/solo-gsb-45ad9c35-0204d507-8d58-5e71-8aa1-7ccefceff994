@@ -12,6 +12,7 @@
 - 池状态可导出为带 **SHA-256 摘要的规范 JSON 快照**，并在一个 SQLite 写事务内校验、恢复（`restore_id` 幂等重放）
 - 可将地址池**分区迁移**为一组两两不重叠、恰好覆盖源池的子池：全部校验与替换在**同一个写事务**内完成，排除网段与已分配子网按归属整体迁入子池（`operation_id` 幂等重放）
 - 可将按优先级排列的 CIDR 允许/拒绝规则**编译**为覆盖整个 scope 的不重叠分段（只读，不触碰地址池与分配数据）
+- 可**按策略批量预留**子网：同一写事务内编译 allow/deny 策略并读取一致的池快照，按输入顺序为每项选取完全落在 allow 段内的最小对齐空闲网段；任一项无空间或命中 deny 时**整批回滚**（`batch_id` 幂等重放，项内 `request_id` 沿用单条分配的幂等语义）
 - 可对 BGP 公告做**无状态 AS 路径审计与 MOAS / 起源变更比对**（只计算，不读写数据库）
 - 可创建**可确认的 BGP 公告计划**：创建时在一致读事务中固定池的排除网段与当前分配、
   复用 AS 路径审计并校验前缀完全位于池内/不碰排除网段/覆盖全部当前分配/同一分配单一起源，
@@ -58,6 +59,7 @@ SUBNET_DB_PATH=./subnets.db .venv/bin/uvicorn app.main:app --host 0.0.0.0 --port
 | `POST` | `/pools/{id}/exclusions` | 追加排除网段 |
 | `POST` | `/pools/{id}/allocations` | 按前缀长度申请子网（需带 `request_id`） |
 | `DELETE` | `/pools/{id}/allocations/{request_id}` | 释放子网 |
+| `POST` | `/pools/{id}/reservations` | 按 allow/deny 策略批量预留子网（单写事务，`batch_id` 幂等） |
 | `POST` | `/pools/{id}/reverse-dns-plan` | 为当前分配生成 RFC 2317 反向 DNS 委派（只读） |
 | `GET` | `/pools/{id}/snapshot` | 导出带 SHA-256 摘要的规范 JSON 池快照 |
 | `POST` | `/pools/{id}/snapshot/restore` | 校验摘要后在一个写事务内恢复池状态（`restore_id` 幂等） |
@@ -673,6 +675,73 @@ curl -X POST http://localhost:8000/pools/1/bgp-plans/release-2026-10-03/activate
   也被串行化：要么激活先提交（成功），要么分配先提交（激活返回冲突），不会出现
   部分生效。
 
+### 14. 按策略批量预留（单写事务）
+
+`POST /pools/{id}/reservations` 在一次调用中**原子地**预留整批子网：调用方提交
+`batch_id`（幂等键）、`default_action`、按优先级排列的 CIDR allow/deny `rules`
+（与 `/cidr-policy/compile` 同一编译器，**scope 即地址池本身**，规则 CIDR 必须
+位于池内）以及若干预留项 `items`（各含 `request_id` 与 `prefix_length`）。
+
+```bash
+curl -X POST http://localhost:8000/pools/1/reservations \
+  -H 'Content-Type: application/json' -d '{
+    "batch_id": "reserve-2026-10-04",
+    "default_action": "deny",
+    "rules": [
+      {"cidr": "10.10.1.0/24", "action": "allow"},
+      {"cidr": "10.10.3.0/25", "action": "allow"}
+    ],
+    "items": [
+      {"request_id": "order-100", "prefix_length": 26},
+      {"request_id": "order-101", "prefix_length": 26}
+    ]
+  }'
+```
+
+```json
+{
+  "batch_id": "reserve-2026-10-04",
+  "pool_id": 1,
+  "reservations": [
+    {"id": 3, "request_id": "order-100", "cidr": "10.10.1.0/26",
+     "prefix_length": 26, "created_at": "2026-10-04T08:00:00+00:00",
+     "replayed": false},
+    {"id": 4, "request_id": "order-101", "cidr": "10.10.1.64/26",
+     "prefix_length": 26, "created_at": "2026-10-04T08:00:00+00:00",
+     "replayed": false}
+  ],
+  "created_at": "2026-10-04T08:00:00+00:00",
+  "replayed": false
+}
+```
+
+**全部工作在同一个 `BEGIN IMMEDIATE` 写事务内完成**：编译策略规则、读取池的
+排除网段与当前分配的一致快照、逐项选取并写入。选取规则与单条分配一致——
+**起始地址最小的对齐网段**——但空闲空间还要再减去所有 deny 段，即每项必须
+**完全落在某个 allow 段内**（空闲空间 = 池 − 排除网段 − 现有分配 − deny 段 −
+本批已选）。各项**按输入顺序**放置，响应中的 `reservations` 映射也按输入顺序
+返回。
+
+**整批回滚**：任一项完全没有连续空闲空间时返回 `409 pool_exhausted`；仅剩的
+空闲空间全部命中 deny 段时返回 `409 policy_denied`。任一失败都使整批回滚——
+**池不发生任何变化**，也不留下批次记录，修正参数后可用同一 `batch_id` 重新
+提交。
+
+**幂等语义**：
+
+- 相同 `batch_id` + 相同参数（规则顺序即优先级、预留项顺序即放置顺序，均敏感）
+  重试：返回存储的原始结果（HTTP 200、`replayed: true`），不会二次预留；
+  即使池此后发生变化也照原样重放；
+- 相同 `batch_id` 但参数变化（不同池、不同默认动作、不同规则或不同预留项）：
+  `409 batch_id_conflict`；
+- 项内 `request_id` 已存在时沿用**单条分配的幂等语义**：同池同前缀长度的项
+  直接解析为现有分配（该项 `replayed: true`，不重复占用空间）；跨池或前缀
+  长度不同返回 `409 request_id_conflict`，整批回滚。同一批次内重复出现的
+  `request_id` 也按此处理（第二次出现解析为本批已选的同一网段）。
+
+成功的预留就是**普通分配**：出现在池状态与快照中，可用
+`DELETE /pools/{id}/allocations/{request_id}` 单独释放。
+
 ## 错误响应
 
 统一格式：
@@ -686,8 +755,10 @@ curl -X POST http://localhost:8000/pools/1/bgp-plans/release-2026-10-03/activate
 | 404 | `pool_not_found` / `allocation_not_found` | 池或分配不存在 |
 | 409 | `pool_exists` / `exclusion_exists` | 池或排除网段已存在 |
 | 409 | `exclusion_overlap` | 排除网段越界占用 |
-| 409 | `pool_exhausted` | 无足够连续空闲空间 |
+| 409 | `pool_exhausted` | 无足够连续空闲空间（含批量预留中任一项无空间，整批回滚） |
 | 409 | `request_id_conflict` | 幂等键复用但参数变化，或恢复快照中的 request_id 已属其他池 |
+| 409 | `batch_id_conflict` | 同一 `batch_id` 曾用于另一池或另一组参数（默认动作/规则/预留项）的批量预留 |
+| 409 | `policy_denied` | 批量预留中某项仅剩的空闲空间全部命中 deny 段，整批回滚 |
 | 409 | `restore_id_conflict` | 同一 `restore_id` 曾用于另一池或另一份摘要 |
 | 409 | `snapshot_restore_conflict` | 恢复写入时撞上数据库唯一约束（如池 CIDR 重复） |
 | 409 | `operation_id_conflict` | 同一 `operation_id` 曾用于另一源池或另一组子网的分区 |
@@ -754,6 +825,11 @@ curl -X POST http://localhost:8000/pools/1/bgp-plans/release-2026-10-03/activate
   激活的全部核对（摘要一致、覆盖与单一起源重新成立）与状态翻转都在单个
   `BEGIN IMMEDIATE` 写事务内完成，池状态变化即整体回滚返回冲突；
   `bgp_plans.plan_id` 主键保证同一计划键并发/重放只保存一条不可变计划。
+- 批量预留的**全部工作**（编译策略、读取一致池快照、逐项选取、写入分配与批次
+  记录）都在单个 `BEGIN IMMEDIATE` 写事务内完成：并发批次被串行化，不同批次
+  不会抢到同一块空间；任一项失败（无空间或命中 deny）整批回滚，不留部分预留；
+  `reservation_batches.batch_id` 上的 `UNIQUE` 约束保证同一批次键并发/重放只
+  真正预留一次，项内 `request_id` 的全局唯一约束仍是最后防线。
 - 数据库开启 WAL 模式，读状态不会阻塞写分配。
 
 ## 项目结构
@@ -767,6 +843,7 @@ curl -X POST http://localhost:8000/pools/1/bgp-plans/release-2026-10-03/activate
 │   ├── db.py          # SQLite 连接、建表、事务管理
 │   ├── cidrmath.py    # CIDR 集合运算：差集、合并、最低对齐选取、委派片段拆分
 │   ├── cidrpolicy.py  # CIDR 策略编译：首条匹配规则 -> 不重叠动作分段（仅同级同动作合并）
+│   ├── reservation.py # 按策略批量预留：单写事务内编译策略+一致快照+逐项选取，batch_id 幂等
 │   ├── bgpaudit.py    # BGP 公告无状态审计：路径折叠/AS 环/山谷自由 + MOAS/起源变更比对
 │   ├── bgpplan.py     # 可确认的 BGP 公告计划：固定池状态摘要，单写事务内重新核对后激活
 │   ├── reversedns.py  # RFC 2317 反向区名运算与 NS/CNAME/PTR 记录生成
