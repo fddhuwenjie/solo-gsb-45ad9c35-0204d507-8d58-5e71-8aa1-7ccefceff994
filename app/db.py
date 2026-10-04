@@ -100,6 +100,18 @@ def init_db() -> None:
                 activated_at     TEXT
             );
 
+            -- One row per completed policy-gated batch reservation.  The
+            -- batch_id primary key makes a retried batch replay the original
+            -- result instead of reserving twice; params is the canonical
+            -- request fingerprint used to detect conflicting reuses.
+            CREATE TABLE IF NOT EXISTS reservation_batches (
+                batch_id    TEXT    PRIMARY KEY,
+                pool_id     INTEGER NOT NULL REFERENCES pools(id) ON DELETE CASCADE,
+                params      TEXT    NOT NULL,
+                result      TEXT    NOT NULL,
+                created_at  TEXT    NOT NULL
+            );
+
             -- Fast lookup of all plans belonging to one pool.
             CREATE INDEX IF NOT EXISTS idx_allocations_pool
                 ON allocations(pool_id);

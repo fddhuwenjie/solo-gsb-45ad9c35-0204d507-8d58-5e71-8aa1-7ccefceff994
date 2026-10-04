@@ -183,6 +183,65 @@ class CidrPolicyCompileResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Policy-gated batch reservations
+# ---------------------------------------------------------------------------
+
+
+class ReservationItemRequest(BaseModel):
+    request_id: str = Field(
+        ..., min_length=1, description="Client-generated idempotency key"
+    )
+    prefix_length: int = Field(..., ge=0, le=32)
+
+
+class BatchReserveRequest(BaseModel):
+    batch_id: str = Field(
+        ...,
+        min_length=1,
+        description="Client-generated idempotency key for the whole batch",
+    )
+    default_action: Literal["allow", "deny"] = Field(
+        ...,
+        description="Action for pool addresses matched by no rule",
+    )
+    rules: list[CidrPolicyRuleRequest] = Field(
+        default_factory=list,
+        description=(
+            "Priority-ordered allow/deny rules compiled over the pool CIDR; "
+            "the first rule containing an address decides its action"
+        ),
+    )
+    items: list[ReservationItemRequest] = Field(
+        ...,
+        min_length=1,
+        description="Reservations to place, processed in input order",
+    )
+
+
+class ReservationItemResponse(BaseModel):
+    request_id: str
+    prefix_length: int
+    cidr: str
+    allocation_id: int = Field(..., description="Row id of the allocation")
+    replayed: bool = Field(
+        ...,
+        description="True when request_id matched an existing allocation",
+    )
+
+
+class BatchReserveResponse(BaseModel):
+    batch_id: str
+    pool_id: int
+    reservations: list[ReservationItemResponse] = Field(
+        ..., description="request_id -> reserved CIDR mapping, in input order"
+    )
+    created_at: str
+    replayed: bool = Field(
+        ..., description="True when a stored batch result was returned"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Pool snapshot export / restore
 # ---------------------------------------------------------------------------
 

@@ -11,12 +11,14 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 
-from . import bgpplan, partition, service, snapshot
+from . import bgpplan, partition, reserve, service, snapshot
 from .db import init_db
 from .schemas import (
     AllocateRequest,
     AllocationResponse,
     AllocationItem,
+    BatchReserveRequest,
+    BatchReserveResponse,
     BgpAuditRequest,
     BgpAuditResponse,
     BgpPlanCreateRequest,
@@ -50,6 +52,7 @@ app = FastAPI(
     version="1.5.0",
     description=(
         "Allocate non-overlapping, aligned IPv4 subnets from address pools, "
+        "reserve policy-gated batches of subnets atomically, "
         "partition pools into exactly covering sub-pools, "
         "build RFC 2317 reverse-DNS delegation plans for current allocations, "
         "statelessly audit BGP announcements against AS relationships, "
@@ -172,6 +175,21 @@ def allocate(pool_id: int, body: AllocateRequest) -> AllocationResponse:
 )
 def release(pool_id: int, request_id: str) -> ReleaseResponse:
     return ReleaseResponse(**service.release(pool_id, request_id))
+
+
+@app.post(
+    "/pools/{pool_id}/reservations",
+    response_model=BatchReserveResponse,
+    status_code=201,
+    tags=["reservations"],
+)
+def reserve_batch(pool_id: int, body: BatchReserveRequest, response: Response) -> BatchReserveResponse:
+    result = reserve.reserve_batch(
+        pool_id, body.batch_id, body.default_action, body.rules, body.items
+    )
+    # 201 for a newly recorded batch, 200 for an idempotent replay.
+    response.status_code = 200 if result["replayed"] else 201
+    return BatchReserveResponse(**result)
 
 
 @app.post(
